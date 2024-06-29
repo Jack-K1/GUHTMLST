@@ -1,5 +1,4 @@
 import pandas as pd
-import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import datetime
@@ -20,17 +19,38 @@ def parse_trade_number_input(input_string):
             trade_numbers.append(int(part.strip()))
     return trade_numbers
 
-def load_trade_data(file_path):
-    trade_data = pd.read_csv(file_path)
-    trade_data['Open DateTime'] = pd.to_datetime(trade_data['Open Time'], format='%Y-%m-%d %H:%M:%S')
-    trade_data['Close DateTime'] = pd.to_datetime(trade_data['Close Time'], format='%Y-%m-%d %H:%M:%S')
-    return trade_data
-
 def load_tick_data(file_path):
+    """
+    Loads tick data (OHLC data) from a CSV file, adjusts for daylight saving time, and sets the DateTime column as the index.
+    """
     tf_ohlc_data = pd.read_csv(file_path)
     tf_ohlc_data['DateTime'] = pd.to_datetime(tf_ohlc_data['DateTime'])
+
+    # Adjust for daylight saving time starting from 2024-03-31
+    dst_start = pd.Timestamp('2024-03-31 00:00:00')
+    tf_ohlc_data['DateTime'] = tf_ohlc_data['DateTime'].apply(lambda dt: dt + pd.Timedelta(hours=1) if dt >= dst_start else dt)
+
     tf_ohlc_data.set_index('DateTime', inplace=True)
     return tf_ohlc_data
+
+def load_trade_data(file_path):
+    """
+    Loads trade data from a CSV file, parses date columns, and adjusts trade times.
+    Args:
+        file_path (str): Path to the trade data CSV file.
+    Returns:
+        pd.DataFrame: DataFrame containing the trade data with adjusted times.
+    """
+    trade_data = pd.read_csv(file_path)
+    trade_data['Open Time'] = pd.to_datetime(trade_data['Open Time'], format='%Y-%m-%d %H:%M')
+    trade_data['Close Time'] = pd.to_datetime(trade_data['Close Time'], format='%Y-%m-%d %H:%M')
+    
+    # Adjust the trade times
+    trade_data = adjust_trade_times(trade_data, hours_offset=-2)
+    
+    trade_data['Open DateTime'] = trade_data['Open Time']
+    trade_data['Close DateTime'] = trade_data['Close Time']
+    return trade_data
 
 def filter_initial_trades(df):
     initial_trades = df.groupby('Close DateTime').first().reset_index()
@@ -225,3 +245,166 @@ def add_bollinger_bands(fig, upper_band, middle_band, lower_band, start_datetime
     fig.add_trace(go.Scatter(x=lower_band.index, y=lower_band, line=dict(color='rgba(76, 175, 80, 0.5)'), name='Lower Bollinger Band'))
     
     return fig
+
+def adjust_trade_times(df, hours_offset=-2):
+    """
+    Adjusts the Open Time and Close Time columns by the specified number of hours.
+    Args:
+        df (pd.DataFrame): DataFrame containing the trade data.
+        hours_offset (int): Number of hours to adjust the times by. Default is -2.
+    Returns:
+        pd.DataFrame: DataFrame with adjusted Open Time and Close Time.
+    """
+    df['Open Time'] = df['Open Time'] + pd.Timedelta(hours=hours_offset)
+    df['Close Time'] = df['Close Time'] + pd.Timedelta(hours=hours_offset)
+    return df
+
+def group_trades_into_signals(trade_data):
+    """
+    Groups trades into signals based on their type and closing time.
+    Args:
+        trade_data (pd.DataFrame): DataFrame containing the trade data.
+    Returns:
+        pd.DataFrame: DataFrame with an additional column indicating the signal group.
+    """
+    trade_data = trade_data.sort_values(by='Open DateTime')
+    trade_data['Signal Group'] = (trade_data['Type'] != trade_data['Type'].shift()).cumsum()
+    
+    for _, group in trade_data.groupby('Signal Group'):
+        close_time = group['Close DateTime'].max()
+        trade_data.loc[group.index, 'Signal Close Time'] = close_time
+
+    return trade_data
+
+def calculate_mean_pips_away(trade_data):
+    """
+    Calculates the mean pips away from the open price of the first trade in each signal and counts the number of trades.
+    Args:
+        trade_data (pd.DataFrame): DataFrame containing the trade data.
+    Returns:
+        pd.DataFrame: DataFrame with the mean pips away and trade count for each signal.
+    """
+    signals = trade_data.groupby('Signal Group')
+    mean_pips_away_list = []
+
+    for signal_group, trades in signals:
+        first_open_price = trades.iloc[0]['Opening Price']
+        trades['Pips Away'] = (trades['Opening Price'] - first_open_price) * 10000  # Assuming pip calculation for GBPUSD
+        mean_pips_away = trades['Pips Away'].mean()
+        trade_count = trades.shape[0]
+        mean_pips_away_list.append({
+            'Signal Group': signal_group, 
+            'Mean Pips Away': mean_pips_away, 
+            'Trade Count': trade_count
+        })
+
+    return pd.DataFrame(mean_pips_away_list)
+
+
+def calculate_median_pips_away(trade_data):
+    """
+    Calculates the median pips away from the open price of the first trade in each signal and counts the number of trades.
+    Args:
+        trade_data (pd.DataFrame): DataFrame containing the trade data.
+    Returns:
+        pd.DataFrame: DataFrame with the median pips away and trade count for each signal.
+    """
+    signals = trade_data.groupby('Signal Group')
+    median_pips_away_list = []
+
+    for signal_group, trades in signals:
+        first_open_price = trades.iloc[0]['Opening Price']
+        trades['Pips Away'] = (trades['Opening Price'] - first_open_price) * 10000  # Assuming pip calculation for GBPUSD
+        median_pips_away = trades['Pips Away'].median()
+        trade_count = trades.shape[0]
+        median_pips_away_list.append({
+            'Signal Group': signal_group, 
+            'Median Pips Away': median_pips_away, 
+            'Trade Count': trade_count
+        })
+
+    return pd.DataFrame(median_pips_away_list)
+
+def calculate_daily_profits(trade_data):
+    """
+    Calculates the daily profits from the trade data.
+    Args:
+        trade_data (pd.DataFrame): DataFrame containing the trade data.
+    Returns:
+        pd.DataFrame: DataFrame with the daily profits.
+    """
+    trade_data['Close Date'] = trade_data['Close DateTime'].dt.date
+    daily_profits = trade_data.groupby('Close Date')['Profit'].sum().reset_index()
+    daily_profits['Close Date'] = pd.to_datetime(daily_profits['Close Date'])
+    return daily_profits
+
+
+def calculate_cumulative_volume(trade_data):
+    """
+    Calculates the cumulative volume for each signal.
+    Args:
+        trade_data (pd.DataFrame): DataFrame containing the trade data.
+    Returns:
+        pd.DataFrame: DataFrame with the cumulative volume for each signal.
+    """
+    cumulative_volume_df = trade_data.groupby('Signal Group')['Volume'].sum().reset_index()
+    return cumulative_volume_df
+
+
+def calculate_cumulative_trades_per_signal(trade_data):
+    """
+    Calculates the cumulative number of trades for each signal.
+    Args:
+        trade_data (pd.DataFrame): DataFrame containing the trade data.
+    Returns:
+        pd.DataFrame: DataFrame with the cumulative number of trades for each signal.
+    """
+    cumulative_trades_df = trade_data.groupby('Signal Group').size().reset_index(name='Trade Count')
+    return cumulative_trades_df
+
+
+
+def calculate_initial_trade_volume(trade_data):
+    """
+    Calculates the volume of the initial trade in each signal.
+    Args:
+        trade_data (pd.DataFrame): DataFrame containing the trade data.
+    Returns:
+        pd.DataFrame: DataFrame with the volume of the initial trade for each signal.
+    """
+    initial_trades = trade_data.groupby('Signal Group').first().reset_index()
+    initial_trade_volume_df = initial_trades[['Signal Group', 'Volume']]
+    return initial_trade_volume_df
+
+def calculate_max_pip_drawdown(trade_data, tf_ohlc_data):
+    """
+    Calculates the maximum pip drawdown for the initial trade in each signal.
+    Args:
+        trade_data (pd.DataFrame): DataFrame containing the trade data.
+        tf_ohlc_data (pd.DataFrame): DataFrame containing the OHLC data.
+    Returns:
+        pd.DataFrame: DataFrame with the maximum pip drawdown for each signal.
+    """
+    initial_trades = trade_data.groupby('Signal Group').first().reset_index()
+    
+    drawdowns = []
+    
+    for _, trade in initial_trades.iterrows():
+        trade_open_time = trade['Open DateTime']
+        trade_close_time = trade['Close DateTime']
+        open_price = trade['Opening Price']
+        
+        # Filter OHLC data for the period of the trade
+        trade_ohlc_data = tf_ohlc_data[(tf_ohlc_data.index >= trade_open_time) & (tf_ohlc_data.index <= trade_close_time)]
+        
+        if trade['Type'] == 'buy':
+            max_drawdown = (trade_ohlc_data['Low'].min() - open_price) * 10000
+        else:
+            max_drawdown = (open_price - trade_ohlc_data['High'].max()) * 10000
+        
+        drawdowns.append({
+            'Signal Group': trade['Signal Group'],
+            'Max Pip Drawdown': max_drawdown
+        })
+    
+    return pd.DataFrame(drawdowns)
